@@ -1841,7 +1841,7 @@ ModelInstanceState::WarmupSession()
       ort_api->AllocatorFree(default_allocator_, buf);
       warmup_ok = false; break;
     }
-    ort_api->BindInput(io_binding_, input_name.c_str(), tensor);
+    (void)ort_api->BindInput(io_binding_, input_name.c_str(), tensor);
     input_tensors_.push_back(tensor);
     // Note: buf is managed by ORT tensor; will be freed when tensor released
   }
@@ -1849,7 +1849,7 @@ ModelInstanceState::WarmupSession()
   if (warmup_ok) {
     // Bind all outputs to CPU to avoid needing GPU output buffers
     for (const auto& [out_name, _] : output_tensor_infos_) {
-      ort_api->BindOutputToDevice(io_binding_, out_name.c_str(), cpu_allocator_info_);
+      (void)ort_api->BindOutputToDevice(io_binding_, out_name.c_str(), cpu_allocator_info_);
     }
     auto run_status = ort_api->RunWithBinding(session_, runOptions_, io_binding_);
     if (run_status != nullptr) {
@@ -2415,6 +2415,9 @@ ModelInstanceState::ProcessRequests(
 
   std::vector<const char*> input_names;
   bool cuda_copy = false;
+  // OPT-7: declared at function scope so the cache-update code can see it
+  // regardless of which branch all_response_failed takes.
+  bool rebuild_device_info = false;
   BackendInputCollector collector(
       requests, request_count, &responses, model_state_->TritonMemoryManager(),
       model_state_->EnablePinnedInput(), CudaStream(), nullptr, nullptr, 0,
@@ -2441,8 +2444,8 @@ ModelInstanceState::ProcessRequests(
     // request.
     // OPT-7: Rebuild output_device_info_ only when request count changes.
     // In steady-state GPU serving all requests want GPU output — rebuilding
-    // O(N_requests × N_outputs) every inference is pure overhead.
-    bool rebuild_device_info =
+    // O(N_requests x N_outputs) every inference is pure overhead.
+    rebuild_device_info =
         !output_device_info_valid_ || (request_count != last_request_count_);
 
     for (auto& output_name : StateForModel()->ModelOutputs()) {
