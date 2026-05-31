@@ -45,7 +45,10 @@
 
 #include <stdint.h>
 
+#include <chrono>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "onnxruntime_loader.h"
@@ -159,6 +162,14 @@ class ModelState : public BackendModel {
   const std::map<std::string, std::pair<int64_t, int64_t>>& ModelOutputs()
   {
     return model_outputs_;
+  }
+
+  // OPT-9: Check whether 'session' is the shared session (for destructor guard).
+  bool IsSharedSession(OrtSession* session) const
+  {
+    std::lock_guard<std::mutex> lock(
+        const_cast<std::mutex&>(shared_session_mutex_));
+    return shared_session_ != nullptr && shared_session_.get() == session;
   }
 
  private:
@@ -1885,12 +1896,12 @@ ModelInstanceState::~ModelInstanceState()
   // For CPU instances (no shared session), session_ is independently owned.
   // We distinguish by checking if shared_session_ holds the same pointer.
   if (session_ != nullptr) {
-    auto& shared = model_state_->shared_session_;
-    if (shared == nullptr || shared.get() != session_) {
-      // Not the shared session — we own it, unload it.
+    // OPT-9: Only unload if this is not the shared session.
+    // Use the public accessor to avoid touching private members.
+    if (!model_state_->IsSharedSession(session_)) {
       OnnxLoader::UnloadSession(session_);
     }
-    // else: shared_ptr owns it; do nothing here.
+    // else: ModelState::shared_ptr owns it; it will be freed when model unloads.
   }
   // 'default_allocator_' is default allocator which is managed by ONNX
   // Runtime
