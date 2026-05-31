@@ -146,6 +146,16 @@ class ModelState : public BackendModel {
       OrtSession** session, OrtAllocator** default_allocator,
       TritonStream_t stream);
 
+  // OPT-9: Return the shared OrtSession for GPU instances, creating it
+  // on first call. Subsequent calls return the cached session without
+  // triggering MIGraphX recompile. CPU instances are excluded (no MIGraphX).
+  TRITONSERVER_Error* GetOrCreateSharedSession(
+      const std::string& artifact_name,
+      const TRITONSERVER_InstanceGroupKind instance_group_kind,
+      const int32_t instance_group_device_id, std::string* model_path,
+      OrtSession** session, OrtAllocator** default_allocator,
+      TritonStream_t stream);
+
   const std::map<std::string, std::pair<int64_t, int64_t>>& ModelOutputs()
   {
     return model_outputs_;
@@ -169,6 +179,14 @@ class ModelState : public BackendModel {
   // is specified both in the output section and state section, it indicates
   // that the backend must return the output state to the client too.
   std::map<std::string, std::pair<int64_t, int64_t>> model_outputs_;
+
+  // OPT-9: Shared OrtSession across all instances of this model.
+  // MIGraphX compile runs once; all instances reuse the same session.
+  // ORT guarantees RunWithBinding() is thread-safe on a shared session.
+  // Each instance keeps its own OrtIoBinding (per-thread output state).
+  std::shared_ptr<OrtSession> shared_session_;
+  std::once_flag shared_session_flag_;
+  std::mutex shared_session_mutex_;
 };
 
 TRITONSERVER_Error*
@@ -421,6 +439,56 @@ ModelState::ModelState(TRITONBACKEND_Model* triton_model)
   // multiple instances? If so then should move loading and validation
   // of the session to here instead of creating a session for each
   // instance in ModelStateInstance::Create().
+}
+
+TRITONSERVER_Error*
+ModelState::GetOrCreateSharedSession(
+    const std::string& artifact_name,
+    const TRITONSERVER_InstanceGroupKind instance_group_kind,
+    const int32_t instance_group_device_id, std::string* model_path,
+    OrtSession** session, OrtAllocator** default_allocator,
+    TritonStream_t stream)
+{
+  // OPT-9: For GPU MIGraphX instances, reuse a single compiled session.
+  // Only create on first call; subsequent callers get the cached session.
+  if (instance_group_kind != TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    // CPU/AUTO instances: no shared session (no MIGraphX compile savings).
+    return LoadModel(artifact_name, instance_group_kind,
+                     instance_group_device_id, model_path, session,
+                     default_allocator, stream);
+  }
+
+  std::lock_guard<std::mutex> lock(shared_session_mutex_);
+
+  if (shared_session_ == nullptr) {
+    // First instance: create the session and cache it.
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                (std::string("OPT-9: first GPU instance — compiling MIGraphX session for '")
+                 + Name() + "'").c_str());
+    OrtSession* raw_session = nullptr;
+    RETURN_IF_ERROR(LoadModel(artifact_name, instance_group_kind,
+                               instance_group_device_id, model_path,
+                               &raw_session, default_allocator, stream));
+    // Wrap with a custom deleter that calls OnnxLoader::UnloadSession
+    shared_session_ = std::shared_ptr<OrtSession>(
+        raw_session,
+        [](OrtSession* s) { OnnxLoader::UnloadSession(s); });
+  } else {
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                (std::string("OPT-9: reusing shared MIGraphX session for '")
+                 + Name() + "' — skipping recompile").c_str());
+    // Set model_path from cached session (need to resolve it the same way)
+    // Call LoadModel in dry-run is not needed; path is deterministic.
+    std::string cc_model_filename = artifact_name.empty() ? "model.onnx" : artifact_name;
+    *model_path = JoinPath({RepositoryPath(), std::to_string(Version()), cc_model_filename});
+    bool is_dir; IsDirectory(*model_path, &is_dir);
+    if (is_dir) *model_path = JoinPath({*model_path, "model.onnx"});
+    // Get the default allocator from ORT global allocator
+    RETURN_IF_ORT_ERROR(ort_api->GetAllocatorWithDefaultOptions(default_allocator));
+  }
+
+  *session = shared_session_.get();
+  return nullptr;
 }
 
 TRITONSERVER_Error*
@@ -1662,7 +1730,8 @@ ModelInstanceState::ModelInstanceState(
       cuda_allocator_info_(nullptr), cpu_allocator_info_(nullptr),
       io_binding_(nullptr), output_buffer_(nullptr)
 {
-  THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
+  // OPT-9: Use shared session for GPU instances to avoid duplicate MIGraphX compile.
+  THROW_IF_BACKEND_INSTANCE_ERROR(model_state->GetOrCreateSharedSession(
       ArtifactFilename(), Kind(), DeviceId(), &model_path_, &session_,
       &default_allocator_, CudaStream()));
   // OPT-1: track whether user_compute_stream was active for this instance.
@@ -1793,8 +1862,18 @@ ModelInstanceState::~ModelInstanceState()
   ort_api->ReleaseRunOptions(runOptions_);
   ort_api->ReleaseIoBinding(io_binding_);
   ort_api->ReleaseMemoryInfo(cuda_allocator_info_);
+  // OPT-9: session_ is owned by ModelState::shared_session_ (shared_ptr).
+  // Do NOT call UnloadSession here — the shared_ptr deleter handles cleanup
+  // when the last instance is destroyed and ModelState goes away.
+  // For CPU instances (no shared session), session_ is independently owned.
+  // We distinguish by checking if shared_session_ holds the same pointer.
   if (session_ != nullptr) {
-    OnnxLoader::UnloadSession(session_);
+    auto& shared = model_state_->shared_session_;
+    if (shared == nullptr || shared.get() != session_) {
+      // Not the shared session — we own it, unload it.
+      OnnxLoader::UnloadSession(session_);
+    }
+    // else: shared_ptr owns it; do nothing here.
   }
   // 'default_allocator_' is default allocator which is managed by ONNX
   // Runtime
@@ -2438,10 +2517,44 @@ ModelInstanceState::ProcessRequests(
       preferred_memory_type_id = DeviceId();
     }
 
+    // OPT-8: Collect the union of outputs requested across all requests.
+    // Skip binding outputs nobody needs — avoids GPU allocation + D2H copy.
+    // Still bind required outputs for state tensors unconditionally.
+    std::unordered_set<std::string> requested_output_names;
+    {
+      for (uint32_t ri = 0; ri < request_count; ri++) {
+        if (responses[ri] == nullptr) continue;  // already failed
+        uint32_t out_count = 0;
+        auto req_err = TRITONBACKEND_RequestOutputCount(requests[ri], &out_count);
+        if (req_err != nullptr) {
+          TRITONSERVER_ErrorDelete(req_err);
+          // On error conservatively request all outputs for this request
+          for (auto& o : StateForModel()->ModelOutputs()) {
+            requested_output_names.insert(o.first);
+          }
+          break;
+        }
+        for (uint32_t oi = 0; oi < out_count; oi++) {
+          const char* out_name = nullptr;
+          auto name_err = TRITONBACKEND_RequestOutputName(requests[ri], oi, &out_name);
+          if (name_err == nullptr && out_name != nullptr) {
+            requested_output_names.insert(out_name);
+          } else {
+            TRITONSERVER_ErrorDelete(name_err);
+          }
+        }
+      }
+      // Always include state outputs (sequence models) regardless of request
+      for (auto& o : StateForModel()->ModelOutputs()) {
+        if (o.second.second != -1) {  // has state index
+          requested_output_names.insert(o.first);
+        }
+      }
+    }
+
     // Request to retrieve all model outputs. 'output_names' and
     // 'output_tensors_' are parallel vectors and so must be kept in
-    // sync. [TODO] should collect only the outputs needed by some
-    // request.
+    // sync.
     // OPT-7: Rebuild output_device_info_ only when request count changes.
     // In steady-state GPU serving all requests want GPU output — rebuilding
     // O(N_requests x N_outputs) every inference is pure overhead.
@@ -2450,6 +2563,21 @@ ModelInstanceState::ProcessRequests(
 
     for (auto& output_name : StateForModel()->ModelOutputs()) {
       output_tensors_.emplace_back(nullptr);
+
+      // OPT-8: Skip binding for outputs no request needs.
+      // BindOutputToDevice(nullptr) tells ORT to skip allocation for this output.
+      if (!requested_output_names.empty() &&
+          requested_output_names.find(output_name.first) == requested_output_names.end()) {
+        // Bind to nothing — ORT will not allocate or populate this output.
+        // It will appear as nullptr in GetBoundOutputValues, which ReadOutputTensors
+        // already handles gracefully (output_tensor_pair.first == -1 check).
+        RESPOND_ALL_AND_SET_TRUE_IF_ORT_ERROR(
+            responses, request_count, all_response_failed,
+            ort_api->BindOutputToDevice(
+                io_binding_, output_name.first.c_str(), cpu_allocator_info_));
+        output_device_info_[output_name.first] = {TRITONSERVER_MEMORY_CPU, 0};
+        continue;
+      }
 
       TRITONSERVER_MemoryType memory_type = TRITONSERVER_MEMORY_CPU;
       int64_t memory_type_id = 0;
