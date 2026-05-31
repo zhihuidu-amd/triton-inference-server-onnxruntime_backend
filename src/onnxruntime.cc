@@ -1925,10 +1925,12 @@ ModelInstanceState::WarmupSession()
     for (auto d : info.dims_) n_elements *= (d > 0 ? d : 1);
     size_t byte_size = n_elements * sizeof(float);  // assume float; safe for warmup
 
+    // Always use CPU for warmup inputs — GPU allocation requires device
+    // visibility which may not be set in the loader thread context.
+    // MIGraphX will still compile GPU kernels from the CPU tensors.
     void* buf = nullptr;
     auto alloc_status = ort_api->AllocatorAlloc(
-        cuda_allocator_info_ ? default_allocator_ : default_allocator_,
-        byte_size, &buf);
+        default_allocator_, byte_size, &buf);
     if (alloc_status != nullptr) {
       LOG_MESSAGE(TRITONSERVER_LOG_WARN, "OPT-11: warmup alloc failed — skipping");
       ort_api->ReleaseStatus(alloc_status);
@@ -1939,7 +1941,7 @@ ModelInstanceState::WarmupSession()
 
     OrtValue* tensor = nullptr;
     auto ort_status = ort_api->CreateTensorWithDataAsOrtValue(
-        cuda_allocator_info_ ? cuda_allocator_info_ : cpu_allocator_info_,
+        cpu_allocator_info_,  // CPU for warmup — safe in any thread context
         buf, byte_size,
         info.dims_.data(), info.dims_.size(),
         info.type_, &tensor);
