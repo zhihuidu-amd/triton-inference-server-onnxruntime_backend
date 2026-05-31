@@ -937,6 +937,20 @@ ModelState::LoadModel(
                   ort_api->SessionOptionsAppendExecutionProvider(
                       soptions, "MIGraphX", c_keys.data(), c_values.data(),
                       keys.size()));
+              // OPT-10: MIGraphX always uses fixed input shapes, so memory
+              // pattern optimization is always safe. Pre-allocates all
+              // intermediate buffers after the first run — eliminates
+              // per-inference hipMalloc for intermediate tensors.
+              RETURN_IF_ORT_ERROR(ort_api->EnableMemPattern(soptions));
+              // OPT-13: Auto-place model initializers (weights) directly on
+              // GPU device memory at session creation — avoids CPU->GPU
+              // weight transfer on first inference.
+              if (instance_group_kind == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+                RETURN_IF_ORT_ERROR(ort_api->AddSessionConfigEntry(
+                    soptions,
+                    "session.use_device_allocator_for_initializers",
+                    "1"));
+              }
               LOG_MESSAGE(
                   TRITONSERVER_LOG_VERBOSE,
                   (std::string("MIGraphX Execution Accelerator is set for '") +
@@ -1529,6 +1543,7 @@ class ModelInstanceState : public BackendModelInstance {
       ModelState* model_state,
       TRITONBACKEND_ModelInstance* triton_model_instance);
   void ReleaseOrtRunResources();
+  void WarmupSession();  // OPT-11: pre-warm MIGraphX compile at load time
   TRITONSERVER_Error* ValidateBooleanSequenceControl(
       triton::common::TritonJson::Value& sequence_batching,
       const std::string& control_kind, bool required, bool* have_control);
@@ -1599,6 +1614,9 @@ class ModelInstanceState : public BackendModelInstance {
   // When true, we skip the explicit hipStreamSynchronize before OrtRun because
   // stream ordering on the shared stream already guarantees input readiness.
   bool migraphx_user_stream_active_{false};
+  // OPT-7: Cache output_device_info_ to avoid rebuilding on every inference.
+  bool output_device_info_valid_{false};
+  size_t last_request_count_{0};
   // map of output name -> bound mem type and id
   std::unordered_map<std::string, std::pair<TRITONSERVER_MemoryType, int64_t>>
       output_device_info_;
@@ -1650,6 +1668,12 @@ ModelInstanceState::ModelInstanceState(
   // OPT-1: track whether user_compute_stream was active for this instance.
   // CudaStream() returns non-null for GPU instances.
   migraphx_user_stream_active_ = (CudaStream() != nullptr);
+
+  // OPT-11: Pre-warm MIGraphX compile at load time so the server only reports
+  // READY after all kernels are compiled. Eliminates first-request latency spike.
+  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+    WarmupSession();
+  }
 
 #ifdef TRITON_ENABLE_GPU
   if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
@@ -1774,6 +1798,73 @@ ModelInstanceState::~ModelInstanceState()
   }
   // 'default_allocator_' is default allocator which is managed by ONNX
   // Runtime
+}
+
+void
+ModelInstanceState::WarmupSession()
+{
+  // OPT-11: Run one dummy inference to trigger MIGraphX kernel compilation.
+  // Uses the actual model input shapes from input_tensor_infos_.
+  // After this call the compiled programs are cached (OPT-3 cache dir).
+  LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+              (std::string("OPT-11: warming up MIGraphX for '") + Name() + "'").c_str());
+
+  auto t0 = std::chrono::steady_clock::now();
+
+  bool warmup_ok = true;
+  for (const auto& [input_name, info] : input_tensor_infos_) {
+    if (info.dims_.empty()) continue;  // skip scalars
+    size_t n_elements = 1;
+    for (auto d : info.dims_) n_elements *= (d > 0 ? d : 1);
+    size_t byte_size = n_elements * sizeof(float);  // assume float; safe for warmup
+
+    void* buf = nullptr;
+    auto alloc_status = ort_api->AllocatorAlloc(
+        cuda_allocator_info_ ? default_allocator_ : default_allocator_,
+        byte_size, &buf);
+    if (alloc_status != nullptr) {
+      LOG_MESSAGE(TRITONSERVER_LOG_WARN, "OPT-11: warmup alloc failed — skipping");
+      ort_api->ReleaseStatus(alloc_status);
+      warmup_ok = false;
+      break;
+    }
+    memset(buf, 0, byte_size);
+
+    OrtValue* tensor = nullptr;
+    auto ort_status = ort_api->CreateTensorWithDataAsOrtValue(
+        cuda_allocator_info_ ? cuda_allocator_info_ : cpu_allocator_info_,
+        buf, byte_size,
+        info.dims_.data(), info.dims_.size(),
+        info.type_, &tensor);
+    if (ort_status != nullptr) {
+      ort_api->ReleaseStatus(ort_status);
+      ort_api->AllocatorFree(default_allocator_, buf);
+      warmup_ok = false; break;
+    }
+    ort_api->BindInput(io_binding_, input_name.c_str(), tensor);
+    input_tensors_.push_back(tensor);
+    // Note: buf is managed by ORT tensor; will be freed when tensor released
+  }
+
+  if (warmup_ok) {
+    // Bind all outputs to CPU to avoid needing GPU output buffers
+    for (const auto& [out_name, _] : output_tensor_infos_) {
+      ort_api->BindOutputToDevice(io_binding_, out_name.c_str(), cpu_allocator_info_);
+    }
+    auto run_status = ort_api->RunWithBinding(session_, runOptions_, io_binding_);
+    if (run_status != nullptr) {
+      LOG_MESSAGE(TRITONSERVER_LOG_WARN, "OPT-11: warmup run failed — first request will be slow");
+      ort_api->ReleaseStatus(run_status);
+    } else {
+      auto t1 = std::chrono::steady_clock::now();
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+      LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                  (std::string("OPT-11: warmup complete for '") + Name() +
+                   "' in " + std::to_string(ms) + "ms").c_str());
+    }
+  }
+
+  ReleaseOrtRunResources();
 }
 
 void
@@ -2348,6 +2439,12 @@ ModelInstanceState::ProcessRequests(
     // 'output_tensors_' are parallel vectors and so must be kept in
     // sync. [TODO] should collect only the outputs needed by some
     // request.
+    // OPT-7: Rebuild output_device_info_ only when request count changes.
+    // In steady-state GPU serving all requests want GPU output — rebuilding
+    // O(N_requests × N_outputs) every inference is pure overhead.
+    bool rebuild_device_info =
+        !output_device_info_valid_ || (request_count != last_request_count_);
+
     for (auto& output_name : StateForModel()->ModelOutputs()) {
       output_tensors_.emplace_back(nullptr);
 
@@ -2368,6 +2465,18 @@ ModelInstanceState::ProcessRequests(
                  output_name.first)
                  .c_str()));
       } else if (iit->second.type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
+        if (!rebuild_device_info) {
+          // OPT-7: Use cached device info — skip majority-vote API calls.
+          auto cached = output_device_info_.find(output_name.first);
+          if (cached != output_device_info_.end()) {
+            memory_type   = cached->second.first;
+            memory_type_id = cached->second.second;
+          } else {
+            // Not in cache yet (first run) — fall through to rebuild.
+            rebuild_device_info = true;
+          }
+        }
+        if (rebuild_device_info) {
         // OPT-5: Query output memory type from the majority of requests rather
         // than only requests[0]. A single CPU-preferring request (e.g. a health
         // probe) would otherwise force all outputs to CPU for the whole batch,
@@ -2425,14 +2534,14 @@ ModelInstanceState::ProcessRequests(
         }
       }
 
+        } // end rebuild_device_info
       // If the cuda allocator is not set, bind the output to CPU.
       if (cuda_allocator_info_ == nullptr) {
         memory_type = TRITONSERVER_MEMORY_CPU;
         memory_type_id = 0;
       }
 
-      // finally save the derived mem type and device id as we need it for
-      // reading the outputs.
+      // OPT-7: Always write back so the cache stays current.
       output_device_info_[output_name.first] = {memory_type, memory_type_id};
 
       RESPOND_ALL_AND_SET_TRUE_IF_ORT_ERROR(
@@ -2465,6 +2574,12 @@ ModelInstanceState::ProcessRequests(
 
   uint64_t compute_start_ns = 0;
   SET_TIMESTAMP(compute_start_ns);
+
+  // OPT-7: Mark cache valid after first successful build.
+  if (!all_response_failed && rebuild_device_info) {
+    output_device_info_valid_ = true;
+    last_request_count_ = request_count;
+  }
 
   if (!all_response_failed) {
     RESPOND_ALL_AND_SET_TRUE_IF_ERROR(
@@ -3081,7 +3196,9 @@ ModelInstanceState::ReadOutputTensors(
   }
 #endif  // TRITON_ENABLE_GPU
 #ifdef TRITON_ENABLE_ROCM
-  if (cuda_copy) {
+  // OPT-6: When MIGraphX uses user_compute_stream, output copies are already
+  // ordered after OrtRun by stream semantics — no explicit CPU sync needed.
+  if (cuda_copy && !migraphx_user_stream_active_) {
     static_cast<void>(hipStreamSynchronize(static_cast<hipStream_t>(stream_)));
   }
 #endif  // TRITON_ENABLE_ROCM
