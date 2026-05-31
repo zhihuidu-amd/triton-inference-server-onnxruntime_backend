@@ -1686,6 +1686,12 @@ class ModelInstanceState : public BackendModelInstance {
   bool output_device_info_valid_{false};
   size_t last_request_count_{0};
 
+  // OPT-15/16: Cache input count and input name list after first inference.
+  // For MIGraphX fixed-shape models these never change.
+  uint32_t cached_input_count_{0};
+  std::vector<std::string> cached_input_names_;
+  bool input_info_cached_{false};
+
   // OPT-14: Cache output tensor dtype and shape after first inference.
   // MIGraphX uses fixed shapes so these never change. Avoids per-inference
   // GetTypeInfo/GetDimensions ORT API calls.
@@ -2566,6 +2572,8 @@ ModelInstanceState::ProcessRequests(
     // Request to retrieve all model outputs. 'output_names' and
     // 'output_tensors_' are parallel vectors and so must be kept in
     // sync.
+    // OPT-15: Pre-reserve output_tensors_ to avoid per-output realloc.
+    output_tensors_.reserve(StateForModel()->ModelOutputs().size());
     // OPT-7: Rebuild output_device_info_ only when request count changes.
     // In steady-state GPU serving all requests want GPU output — rebuilding
     // O(N_requests x N_outputs) every inference is pure overhead.
@@ -2802,8 +2810,18 @@ ModelInstanceState::SetInputTensors(
 
   // All requests must have equally-sized input tensors so use any
   // request as the representative for the input tensors.
+  // OPT-16: Cache input_count — it never changes for fixed-shape MIGraphX models.
   uint32_t input_count;
-  RETURN_IF_ERROR(TRITONBACKEND_RequestInputCount(requests[0], &input_count));
+  if (input_info_cached_) {
+    input_count = cached_input_count_;
+  } else {
+    RETURN_IF_ERROR(TRITONBACKEND_RequestInputCount(requests[0], &input_count));
+    cached_input_count_ = input_count;
+  }
+
+  // OPT-15: Pre-reserve vectors to avoid realloc on emplace_back.
+  input_names->reserve(input_count);
+  input_tensors_.reserve(input_count);
 
   for (uint32_t input_idx = 0; input_idx < input_count; input_idx++) {
     TRITONBACKEND_Input* input;
@@ -2965,6 +2983,11 @@ ModelInstanceState::SetInputTensors(
       RETURN_IF_ORT_ERROR(ort_api->BindInput(
           io_binding_, input_name.c_str(), input_tensors_.back()));
     }
+  }
+
+  // OPT-16: Mark input cache valid after first successful pass.
+  if (!input_info_cached_) {
+    input_info_cached_ = true;
   }
 
   // Finalize...
