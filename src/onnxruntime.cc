@@ -1685,6 +1685,17 @@ class ModelInstanceState : public BackendModelInstance {
   // OPT-7: Cache output_device_info_ to avoid rebuilding on every inference.
   bool output_device_info_valid_{false};
   size_t last_request_count_{0};
+
+  // OPT-14: Cache output tensor dtype and shape after first inference.
+  // MIGraphX uses fixed shapes so these never change. Avoids per-inference
+  // GetTypeInfo/GetDimensions ORT API calls.
+  struct CachedOutputInfo {
+    TRITONSERVER_DataType dtype;
+    std::vector<int64_t> shape;
+    bool is_string{false};
+  };
+  std::unordered_map<std::string, CachedOutputInfo> cached_output_info_;
+  bool output_info_cached_{false};
   // map of output name -> bound mem type and id
   std::unordered_map<std::string, std::pair<TRITONSERVER_MemoryType, int64_t>>
       output_device_info_;
@@ -3255,9 +3266,34 @@ ModelInstanceState::ReadOutputTensors(
       std::vector<std::vector<char>> string_buffers;
       std::vector<size_t> offsets;
 
-      RETURN_IF_ERROR(ReadOutputTensor(
-          batchn_shape, dtype, output_tensor, &output_buffer, string_buffers,
-          offsets));
+      // OPT-14: Use cached type/shape for fixed-shape MIGraphX outputs.
+      // GetTypeInfo/GetDimensions are called only on the first inference;
+      // subsequent inferences reuse the cached values.
+      auto cached_it = cached_output_info_.find(name);
+      if (output_info_cached_ && cached_it != cached_output_info_.end()) {
+        dtype        = cached_it->second.dtype;
+        batchn_shape = cached_it->second.shape;
+        // Still need the actual buffer pointer from the ORT value
+        if (!cached_it->second.is_string) {
+          RETURN_IF_ORT_ERROR(
+              ort_api->GetTensorMutableData(output_tensor, &output_buffer));
+        } else {
+          // String tensors: always call full path (variable content length)
+          RETURN_IF_ERROR(ReadOutputTensor(
+              batchn_shape, dtype, output_tensor, &output_buffer,
+              string_buffers, offsets));
+        }
+      } else {
+        RETURN_IF_ERROR(ReadOutputTensor(
+            batchn_shape, dtype, output_tensor, &output_buffer, string_buffers,
+            offsets));
+        // Cache type/shape for next inference
+        CachedOutputInfo info;
+        info.dtype     = dtype;
+        info.shape     = batchn_shape;
+        info.is_string = (dtype == TRITONSERVER_TYPE_BYTES);
+        cached_output_info_[name] = std::move(info);
+      }
 
       // If the number of dimensions is equal to zero, it means that it is a
       // scalar and it would use the dimensions specified in the model
@@ -3316,6 +3352,12 @@ ModelInstanceState::ReadOutputTensors(
           name, *batch_output, output_buffer, alloc_perference.first,
           alloc_perference.second);
     }
+  }
+
+  // OPT-14: Mark output info cache valid after first complete pass.
+  if (!output_info_cached_ &&
+      cached_output_info_.size() == model_outputs.size()) {
+    output_info_cached_ = true;
   }
 
   // Finalize and wait for any pending buffer copies.
