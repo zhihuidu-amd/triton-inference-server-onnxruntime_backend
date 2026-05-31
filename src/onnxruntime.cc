@@ -1766,10 +1766,16 @@ ModelInstanceState::ModelInstanceState(
   // CudaStream() returns non-null for GPU instances.
   migraphx_user_stream_active_ = (CudaStream() != nullptr);
 
-  // OPT-11: Pre-warm MIGraphX compile at load time so the server only reports
-  // READY after all kernels are compiled. Eliminates first-request latency spike.
-  if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
-    WarmupSession();
+  // OPT-11: Pre-warm MIGraphX compile at load time (opt-in via env var).
+  // Disabled by default: MIGraphX compilation during instance init can crash
+  // in some container environments before the GPU context is fully ready.
+  // Enable with: TRITON_MIGRAPHX_WARMUP=1
+  {
+    const char* warmup_env = std::getenv("TRITON_MIGRAPHX_WARMUP");
+    bool do_warmup = (warmup_env != nullptr && std::string(warmup_env) == "1");
+    if (do_warmup && Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+      WarmupSession();
+    }
   }
 
 #ifdef TRITON_ENABLE_GPU
@@ -1913,6 +1919,15 @@ ModelInstanceState::WarmupSession()
   // OPT-11: Run one dummy inference to trigger MIGraphX kernel compilation.
   // Uses the actual model input shapes from input_tensor_infos_.
   // After this call the compiled programs are cached (OPT-3 cache dir).
+  // OPT-11: Guard entire warmup — if MIGraphX or ROCm is not accessible
+  // in this context (e.g. container without --device=/dev/kfd), silently skip.
+  // The first real request will still work; we just lose the pre-warm benefit.
+  if (cuda_allocator_info_ == nullptr) {
+    LOG_MESSAGE(TRITONSERVER_LOG_INFO,
+                "OPT-11: skipping warmup — no GPU allocator (CPU instance)");
+    return;
+  }
+
   LOG_MESSAGE(TRITONSERVER_LOG_INFO,
               (std::string("OPT-11: warming up MIGraphX for '") + Name() + "'").c_str());
 
@@ -1962,7 +1977,10 @@ ModelInstanceState::WarmupSession()
     }
     auto run_status = ort_api->RunWithBinding(session_, runOptions_, io_binding_);
     if (run_status != nullptr) {
-      LOG_MESSAGE(TRITONSERVER_LOG_WARN, "OPT-11: warmup run failed — first request will be slow");
+      LOG_MESSAGE(TRITONSERVER_LOG_WARN,
+                  (std::string("OPT-11: warmup run failed (") +
+                   ort_api->GetErrorMessage(run_status) +
+                   ") — first request will be slow").c_str());
       ort_api->ReleaseStatus(run_status);
     } else {
       auto t1 = std::chrono::steady_clock::now();
