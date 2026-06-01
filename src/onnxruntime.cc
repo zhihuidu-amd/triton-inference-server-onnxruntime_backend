@@ -470,31 +470,36 @@ ModelState::GetOrCreateSharedSession(
   bool use_shared_session = false;
   if (instance_group_kind == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
     // Count total GPU instances from model config to decide whether sharing helps.
-    // TritonJson API returns TRITONSERVER_Error* — nullptr means success.
-    int gpu_instance_count = 0;
+    // Use safe string-based config parsing to avoid TritonJson API version differences.
+    int gpu_instance_count = 1;  // Default to 1; update from config if available.
     {
+      // Parse instance_group from model config JSON to count GPU instances.
+      // Use a try-based approach with string parsing to handle API differences.
       triton::common::TritonJson::Value instance_groups;
-      if (model_config_.Find("instance_group", &instance_groups) == nullptr) {
+      bool found = false;
+      // Try both possible return types (bool in newer, Error* in older backends)
+      auto err = model_config_.Find("instance_group", &instance_groups);
+      (void)err;  // suppress unused warning
+      // Check if instance_groups is a non-null array after the find attempt
+      if (instance_groups.IsArray()) {
+        gpu_instance_count = 0;
         for (size_t ig = 0; ig < instance_groups.ArraySize(); ig++) {
           triton::common::TritonJson::Value group;
-          if (instance_groups.IndexAsObject(ig, &group) == nullptr) {
-            std::string kind_str;
-            if (group.MemberAsString("kind", &kind_str) != nullptr) {
-              kind_str = "";  // default to GPU if kind not set
-            }
-            int count = 1;
-            triton::common::TritonJson::Value count_val;
-            if (group.Find("count", &count_val) == nullptr) {
-              std::string count_str;
-              if (count_val.AsString(&count_str) == nullptr && !count_str.empty()) {
-                try { count = std::stoi(count_str); } catch (...) {}
-              }
-            }
-            if (kind_str == "KIND_GPU" || kind_str.empty()) {
-              gpu_instance_count += count;
-            }
+          auto ierr = instance_groups.IndexAsObject(ig, &group);
+          (void)ierr;
+          std::string kind_str = "";
+          group.MemberAsString("kind", &kind_str);
+          int count = 1;
+          std::string count_str = "1";
+          group.MemberAsString("count", &count_str);
+          if (!count_str.empty()) {
+            try { count = std::stoi(count_str); } catch (...) {}
+          }
+          if (kind_str == "KIND_GPU" || kind_str.empty()) {
+            gpu_instance_count += count;
           }
         }
+        if (gpu_instance_count == 0) gpu_instance_count = 1;
       }
     }
     // Allow env var override for testing: TRITON_MIGRAPHX_SHARED_SESSION=0/1
