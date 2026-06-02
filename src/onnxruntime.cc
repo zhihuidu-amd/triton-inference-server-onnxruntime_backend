@@ -1122,11 +1122,9 @@ ModelState::LoadModel(
                   // Auto-gate on max_batch_size
                   enable_mem_pattern = (MaxBatchSize() >= 64);
                 }
-                if (enable_mem_pattern) {
-                  RETURN_IF_ORT_ERROR(ort_api->EnableMemPattern(soptions));
-                  LOG_MESSAGE(TRITONSERVER_LOG_VERBOSE,
-                    "OPT-10: memory pattern enabled (max_batch_size >= 64)");
-                }
+                // OPT-10 disabled: EnableMemPattern causes MIGraphX segfault
+                // on some node configurations. Leaving disabled until root cause fixed.
+                (void)enable_mem_pattern;
               }
               // OPT-13 is now Tier-3 configurable via
               // migraphx_device_allocator_for_initializers="1" in config.pbtxt.
@@ -1859,8 +1857,8 @@ ModelInstanceState::ModelInstanceState(
       cuda_allocator_info_(nullptr), cpu_allocator_info_(nullptr),
       io_binding_(nullptr), output_buffer_(nullptr)
 {
-  // OPT-9: Use shared session for GPU instances to avoid duplicate MIGraphX compile.
-  THROW_IF_BACKEND_INSTANCE_ERROR(model_state->GetOrCreateSharedSession(
+  // OPT-9 disabled: shared session causes initialization issues on some nodes.
+  THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
       ArtifactFilename(), Kind(), DeviceId(), &model_path_, &session_,
       &default_allocator_, CudaStream()));
   // OPT-1: track whether user_compute_stream was active for this instance.
